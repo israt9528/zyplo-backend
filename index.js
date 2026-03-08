@@ -113,6 +113,16 @@ async function run() {
           (myEmail && normalizeEmail(m.email) === myEmail),
       );
     };
+    const isWorkspaceAdmin = (workspace, me) => {
+      const myId = String(me?.id || "");
+      const myEmail = normalizeEmail(me?.email);
+      return (workspace?.members || []).some((m) => {
+        const role = String(m.role || "").toLowerCase();
+        const byId = myId && String(m.userId || "") === myId;
+        const byEmail = myEmail && normalizeEmail(m.email) === myEmail;
+        return (byId || byEmail) && role === "admin";
+      });
+    };
 
     const isValidId = (v) => ObjectId.isValid(String(v || ""));
     const statusFromColumnName = (name) =>
@@ -1132,9 +1142,10 @@ async function run() {
     // Invite Feature--------->Rifat_START
 
     // get all invites for a workspace.
-    app.get("/workspaces/:workspaceId/invites", async (req, res) => {
+    app.get("/workspaces/:workspaceId/invites", verifyToken, async (req, res) => {
       try {
         const { workspaceId } = req.params;
+        const me = getUserIdentity(req);
 
         // isValidId--> checks valid workspaceId
         if (!isValidId(workspaceId)) {
@@ -1152,6 +1163,9 @@ async function run() {
           return res
             .status(404)
             .json({ ok: false, message: "Workspace not found" });
+        }
+        if (!isWorkspaceMember(workspace, me)) {
+          return res.status(403).json({ ok: false, message: "Forbidden" });
         }
 
         // finds all invites under a workspace
@@ -1185,12 +1199,13 @@ async function run() {
     });
 
     // post invites
-    app.post("/workspaces/:workspaceId/invites", async (req, res) => {
+    app.post("/workspaces/:workspaceId/invites", verifyToken, async (req, res) => {
       try {
         const clientSideData = inviteSchema.parse(req.body);
         const role = clientSideData.role;
         const email = normalizeEmail(clientSideData.email);
         const { workspaceId } = req.params;
+        const me = getUserIdentity(req);
 
         // Checks valid workspace
         if (!isValidId(workspaceId)) {
@@ -1207,6 +1222,9 @@ async function run() {
           return res
             .status(404)
             .json({ ok: false, message: "Workspace not found" });
+        }
+        if (!isWorkspaceAdmin(workspace, me)) {
+          return res.status(403).json({ ok: false, message: "Forbidden" });
         }
         // generate random token for URL and hashed version for DB
         const rawToken = crypto.randomBytes(32).toString("hex");
@@ -1425,9 +1443,10 @@ async function run() {
     });
 
     // accept invitation and update workspace member
-    app.post("/invites/:choice", async (req, res) => {
+    app.post("/invites/:choice", verifyToken, async (req, res) => {
       const { choice } = req.params;
-      const { token, email, id } = req.body;
+      const { token } = req.body;
+      const me = getUserIdentity(req);
 
       // check if token is sent
       if (!token)
@@ -1485,8 +1504,8 @@ async function run() {
       }
 
       //  Now if the user accept the invitation...
-      const userEmail = normalizeEmail(email);
-      if (!id) {
+      const userEmail = normalizeEmail(me.email);
+      if (!me.id) {
         return res.status(400).json({
           message: "User id is required",
           ok: false,
@@ -1537,8 +1556,8 @@ async function run() {
       // invitee's workspace member data
       const member = {
         id: new ObjectId().toString(),
-        userId: id,
-        name: userEmail.split("@")[0] || "Member",
+        userId: String(me.id),
+        name: me.name || userEmail.split("@")[0] || "Member",
         email: userEmail,
         role: findInvite.role,
       };
@@ -1574,16 +1593,11 @@ async function run() {
     // delete a sent invite
     app.delete(
       "/workspaces/:workspaceId/invites/:inviteId",
+      verifyToken,
       async (req, res) => {
         try {
           const { workspaceId, inviteId } = req.params;
-          const requesterEmail = normalizeEmail(req.body?.email);
-
-          if (!requesterEmail) {
-            return res
-              .status(400)
-              .json({ ok: false, message: "Email is required" });
-          }
+          const me = getUserIdentity(req);
 
           if (!isValidId(workspaceId) || !isValidId(inviteId)) {
             return res
@@ -1599,13 +1613,7 @@ async function run() {
               .status(404)
               .json({ ok: false, message: "Workspace not found" });
           }
-
-          const adminMember = (workspace.members || []).find((m) => {
-            const byEmail = normalizeEmail(m.email) === requesterEmail;
-            const role = String(m.role || "").toLowerCase();
-            return byEmail && role === "admin";
-          });
-          if (!adminMember) {
+          if (!isWorkspaceAdmin(workspace, me)) {
             return res.status(403).json({
               ok: false,
               message: "Only admin can delete invites",
