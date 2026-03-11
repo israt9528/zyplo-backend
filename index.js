@@ -844,12 +844,25 @@ async function run() {
           ? lastTask[0].order + 1
           : 0;
 
+      // Find the highest taskNumber in this project to auto-increment.
+      // This powers "ZYP-1", "ZYP-2" style references in GitHub PRs and commits.
+      const lastNumberedTask = await tasksCollection
+        .find({ projectId: toId(projectId) })
+        .sort({ taskNumber: -1 })
+        .limit(1)
+        .toArray();
+      const nextTaskNumber =
+        lastNumberedTask.length > 0
+          ? (lastNumberedTask[0].taskNumber || 0) + 1
+          : 1;
+
       const task = {
         workspaceId: toId(workspaceId),
         projectId: toId(projectId),
         boardId: toId(boardId),
         columnId: toId(columnId),
         order: nextOrder,
+        taskNumber: nextTaskNumber,
         projectName: project.name,
         title: title.trim(),
         description,
@@ -2833,10 +2846,14 @@ async function run() {
       });
       if (!project) return null;
 
-      // Then find the task with that project and task number
+      // Tasks store projectId as either an ObjectId or a plain string depending on when they were created.
+      // Query both to be safe.
+      const projectIdAsString = String(project._id);
       return tasksCollection.findOne({
-        projectId: project._id,
-        taskNumber: taskNumber,
+        $or: [
+          { projectId: project._id, taskNumber: taskNumber },
+          { projectId: projectIdAsString, taskNumber: taskNumber },
+        ],
       });
     }
 
