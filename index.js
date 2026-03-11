@@ -65,6 +65,7 @@ async function run() {
     const timeLogsCollection = db.collection("timeLogs");
     const notificationsCollection = db.collection("notifications");
     const inviteCollection = db.collection("invites");
+    const commentsCollection = db.collection("comments");
 
     await notificationsCollection.createIndex({ userId: 1, createdAt: -1 });
     await notificationsCollection.createIndex({ userId: 1, read: 1 });
@@ -2716,8 +2717,321 @@ async function run() {
       },
     );
 
+    // POST /api/comments- Lipi Start-----------------------------------------------------------
+
+    app.get("/dashboard/tasks/:id", async (req, res) => {
+      const { id } = req.params;
+
+      const result = await tasksCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      res.json({
+        result,
+      });
+    });
+
+    // POST ROUTE: Add a comment to a specific task
+    app.post("/dashboard/:id/comments", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { text, author } = req.body;
+
+        const commentData = {
+          taskId: id,
+          text: text,
+          author: author || "Anonymous",
+          createdAt: new Date().toISOString(),
+        };
+
+        const result = await commentsCollection.insertOne(commentData);
+
+        res.json({
+          ok: true,
+          data: {
+            ...commentData,
+            id: result.insertedId,
+          },
+        });
+      } catch (err) {
+        console.error("POST Comment Error:", err);
+        res.status(500).json({ error: "Failed to post comment" });
+      }
+    });
+
+    // GET ROUTE: Fetch all comments for a specific task
+    app.get("/dashboard/comments/:taskId", async (req, res) => {
+      try {
+        const { taskId } = req.params;
+
+        const comments = await commentsCollection
+          .find({ taskId: taskId })
+          .sort({ createdAt: -1 }) // Newest first
+          .toArray();
+
+        return res.json(comments);
+      } catch (err) {
+        console.error("GET Comments Error:", err);
+        res.status(500).json({ error: "Server error" });
+      }
+    });
+    // ------------------------------Lipi end--------------------------------------------
+
     // Invite Feature--------->Rifat_END
-// Hello Checking out the new branch
+
+    // ==========================================================================
+    // GITHUB INTEGRATION
+    // ==========================================================================
+    // Webhook endpoint: POST /github/webhook
+    // GitHub sends all events here. We read the event type from the header
+    // and dispatch to the right handler below.
+    //
+    // To set this up in GitHub:
+    //   Repo → Settings → Webhooks → Add webhook
+    //   Payload URL: https://your-backend.com/github/webhook
+    //   Content type: application/json
+    //   Events: Pull requests, Pushes, Issues
+    // ==========================================================================
+
+    // --- Task Reference Parser ------------------------------------------------
+
+    // Matches "ZYP-123", "PROJ-4", etc. anywhere in a string
+    const TASK_REFERENCE_PATTERN = /([A-Z]{2,6})-(\d+)/g;
+
+    // Returns the first task reference found, e.g. { taskPrefix: "ZYP", taskNumber: 24 }
+    function extractTaskReference(text) {
+      if (!text) return null;
+      const match = TASK_REFERENCE_PATTERN.exec(text);
+      TASK_REFERENCE_PATTERN.lastIndex = 0;
+      if (!match) return null;
+      return { taskPrefix: match[1], taskNumber: parseInt(match[2], 10) };
+    }
+
+    // Returns ALL task references — useful for commit messages touching multiple tasks
+    function extractAllTaskReferences(text) {
+      if (!text) return [];
+      const references = [];
+      let match;
+      while ((match = TASK_REFERENCE_PATTERN.exec(text)) !== null) {
+        references.push({ taskPrefix: match[1], taskNumber: parseInt(match[2], 10) });
+      }
+      TASK_REFERENCE_PATTERN.lastIndex = 0;
+      return references;
+    }
+
+    // --- Database Helpers -----------------------------------------------------
+
+    // Finds a task by its project key + task number.
+    // In Zyplo, "ZYP-24" means: project with key="ZYP", task number 24.
+    // Tasks don't store a task number today — we match by project key and
+    // store the taskNumber in a new `taskNumber` field going forward.
+    // For existing tasks, this will return null until they are re-saved with taskNumber.
+    async function findTaskByReference(taskPrefix, taskNumber) {
+      // First find the project with this key
+      const project = await projectsCollection.findOne({
+        key: taskPrefix.toUpperCase(),
+      });
+      if (!project) return null;
+
+      // Then find the task with that project and task number
+      return tasksCollection.findOne({
+        projectId: project._id,
+        taskNumber: taskNumber,
+      });
+    }
+
+    // Appends a linked pull request entry to a task document
+    async function linkPullRequestToTask(taskId, pullRequestInfo) {
+      await tasksCollection.updateOne(
+        { _id: toId(taskId) },
+        {
+          $push: { linkedPullRequests: pullRequestInfo },
+          $set: { updatedAt: now() },
+        },
+      );
+    }
+
+    // Appends a linked commit entry to a task document
+    async function recordCommitForTask(taskId, commitInfo) {
+      await tasksCollection.updateOne(
+        { _id: toId(taskId) },
+        {
+          $push: { linkedCommits: commitInfo },
+          $set: { updatedAt: now() },
+        },
+      );
+    }
+
+    // --- Event Handlers -------------------------------------------------------
+
+    // Handles pull_request events — links a PR to a task when it's opened.
+    //
+    // Example GitHub payload:
+    // {
+    //   action: "opened",
+    //   number: 42,
+    //   pull_request: { title: "ZYP-24 Fix login bug", html_url: "...", user: { login: "octocat" } },
+    //   repository: { full_name: "org/repo" }
+    // }
+    async function handlePullRequestEvent(payload) {
+      const { action, pull_request: pullRequest, repository } = payload;
+
+      if (action !== "opened") return;
+
+      const taskReference = extractTaskReference(pullRequest.title);
+      if (!taskReference) {
+        console.log(`[GitHub/PR] No task reference in PR title: "${pullRequest.title}"`);
+        return;
+      }
+
+      const task = await findTaskByReference(taskReference.taskPrefix, taskReference.taskNumber);
+      if (!task) {
+        console.log(`[GitHub/PR] No task found for ${taskReference.taskPrefix}-${taskReference.taskNumber}`);
+        return;
+      }
+
+      await linkPullRequestToTask(String(task._id), {
+        pullRequestNumber: pullRequest.number,
+        pullRequestTitle: pullRequest.title,
+        pullRequestUrl: pullRequest.html_url,
+        repositoryName: repository.full_name,
+        authorUsername: pullRequest.user.login,
+        linkedAt: now(),
+      });
+
+      console.log(`[GitHub/PR] Linked PR #${pullRequest.number} to task ${taskReference.taskPrefix}-${taskReference.taskNumber}`);
+    }
+
+    // Handles push events — scans each commit message for task references.
+    //
+    // Example GitHub payload:
+    // {
+    //   commits: [{ id: "abc123", message: "ZYP-88 fix validation", url: "...", author: { username: "octocat" } }],
+    //   repository: { full_name: "org/repo" }
+    // }
+    async function handlePushEvent(payload) {
+      const { commits, repository } = payload;
+      if (!commits || commits.length === 0) return;
+
+      for (const commit of commits) {
+        const taskReferences = extractAllTaskReferences(commit.message);
+        if (taskReferences.length === 0) continue;
+
+        for (const taskReference of taskReferences) {
+          const task = await findTaskByReference(taskReference.taskPrefix, taskReference.taskNumber);
+          if (!task) {
+            console.log(`[GitHub/Push] No task found for ${taskReference.taskPrefix}-${taskReference.taskNumber}`);
+            continue;
+          }
+
+          await recordCommitForTask(String(task._id), {
+            commitSha: commit.id,
+            commitMessage: commit.message,
+            authorUsername: commit.author?.username || "unknown",
+            repositoryName: repository.full_name,
+            commitUrl: commit.url,
+            linkedAt: now(),
+          });
+
+          console.log(`[GitHub/Push] Recorded commit ${commit.id.slice(0, 7)} on task ${taskReference.taskPrefix}-${taskReference.taskNumber}`);
+        }
+      }
+    }
+
+    // Handles issues events — creates a Zyplo task when a GitHub issue is opened.
+    // NOTE: This requires a workspaceId + projectId + boardId + columnId to place the task.
+    // Those must be stored in your .env or passed via a custom GitHub webhook header.
+    //
+    // Example GitHub payload:
+    // {
+    //   action: "opened",
+    //   issue: { title: "Button broken on mobile", body: "Steps...", html_url: "...", user: { login: "octocat" } },
+    //   repository: { full_name: "org/repo" }
+    // }
+    async function handleIssueEvent(payload) {
+      const { action, issue } = payload;
+      if (action !== "opened") return;
+
+      // These tell Zyplo where to place the auto-created task.
+      // Set them in your .env file for the repo you're integrating with.
+      const targetWorkspaceId = process.env.GITHUB_DEFAULT_WORKSPACE_ID;
+      const targetProjectId = process.env.GITHUB_DEFAULT_PROJECT_ID;
+      const targetBoardId = process.env.GITHUB_DEFAULT_BOARD_ID;
+      const targetColumnId = process.env.GITHUB_DEFAULT_COLUMN_ID;
+
+      if (!targetWorkspaceId || !targetProjectId || !targetBoardId || !targetColumnId) {
+        console.log("[GitHub/Issue] Skipping auto-task creation — GITHUB_DEFAULT_* env vars not set");
+        return;
+      }
+
+      const project = await projectsCollection.findOne({ _id: toId(targetProjectId) });
+
+      const lastTask = await tasksCollection
+        .find({ projectId: toId(targetProjectId) })
+        .sort({ taskNumber: -1 })
+        .limit(1)
+        .toArray();
+      const nextTaskNumber = lastTask.length > 0 ? (lastTask[0].taskNumber || 0) + 1 : 1;
+
+      await tasksCollection.insertOne({
+        workspaceId: toId(targetWorkspaceId),
+        projectId: toId(targetProjectId),
+        boardId: toId(targetBoardId),
+        columnId: toId(targetColumnId),
+        taskNumber: nextTaskNumber,
+        projectName: project?.name || "",
+        title: issue.title,
+        description: issue.body || "",
+        priority: "P2",
+        status: "todo",
+        dueDate: "",
+        assigneeId: "",
+        assigneeName: "Unassigned",
+        estimatedTime: 0,
+        totalTimeSpent: 0,
+        remainingTime: 0,
+        attachments: [],
+        sourceGithubIssueUrl: issue.html_url,
+        createdAt: now(),
+        updatedAt: now(),
+      });
+
+      console.log(`[GitHub/Issue] Created task from GitHub issue: "${issue.title}"`);
+    }
+
+    // --- Webhook Route --------------------------------------------------------
+
+    // Maps GitHub's x-github-event header values to handler functions.
+    // Add a new entry here to support more event types.
+    const githubEventHandlers = {
+      pull_request: handlePullRequestEvent,
+      push: handlePushEvent,
+      issues: handleIssueEvent,
+    };
+
+    app.post("/github/webhook", async (req, res) => {
+      const githubEventType = req.headers["x-github-event"];
+
+      if (!githubEventType) {
+        return res.status(400).json({ error: "Missing x-github-event header" });
+      }
+
+      const eventHandler = githubEventHandlers[githubEventType];
+
+      if (!eventHandler) {
+        // Always return 200 — GitHub will disable your webhook if it gets too many non-2xx responses
+        console.log(`[GitHub/Webhook] Unhandled event type: "${githubEventType}"`);
+        return res.status(200).json({ message: `Event "${githubEventType}" acknowledged but not handled` });
+      }
+
+      await eventHandler(req.body);
+
+      return res.status(200).json({ message: `Event "${githubEventType}" processed` });
+    });
+
+    // ==========================================================================
+    // END GITHUB INTEGRATION
+    // ==========================================================================
 
     // Send a ping to confirm a successful connection
     // await client.db("admin").command({ ping: 1 });
